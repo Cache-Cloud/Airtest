@@ -38,6 +38,8 @@ class AirtestCase(unittest.TestCase):
                     dev.start_recording()
                 except:
                     traceback.print_exc()
+        # support for if __name__ == '__main__'
+        self.scope['__name__'] = '__main__'
 
     def tearDown(self):
         if self.args.log and self.args.recording:
@@ -69,7 +71,7 @@ class AirtestCase(unittest.TestCase):
         try:
             exec(compile(code.encode("utf-8"), pyfilepath, 'exec'), self.scope)
         except Exception as err:
-            log(err, desc="Final Error", snapshot=True)
+            log(err, desc="Final Error", snapshot=True if G.DEVICE_LIST else False)
             six.reraise(*sys.exc_info())
 
     @classmethod
@@ -154,4 +156,6 @@ def run_script(parsed_args, testcase_cls=AirtestCase):
     suite.addTest(testcase_cls())
     result = unittest.TextTestRunner(verbosity=0).run(suite)
     if not result.wasSuccessful():
+        if result.failures and "AssertionError" in repr(result.failures):
+            sys.exit(20)
         sys.exit(-1)

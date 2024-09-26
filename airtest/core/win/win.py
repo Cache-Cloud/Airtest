@@ -5,25 +5,29 @@ import socket
 import subprocess
 import numpy
 import mss
+import psutil
 from functools import wraps
 import win32api
+import win32clipboard
 import pywintypes  # noqa
 import os
 
 from pywinauto.application import Application
 from pywinauto import mouse, keyboard
 from pywinauto.win32structures import RECT
-from pywinauto.win32functions import SetForegroundWindow
 
 from airtest.core.win.ctypesinput import key_press, key_release
 
 from airtest import aircv
-from airtest.aircv.screen_recorder import ScreenRecorder
+from airtest.aircv.screen_recorder import ScreenRecorder, resize_by_max, get_max_size
 from airtest.core.device import Device
 from airtest.core.settings import Settings as ST
+from airtest.utils.snippet import get_absolute_coordinate
 from airtest.utils.logger import get_logger
+from airtest.core.win.screen import screenshot
 
 LOGGING = get_logger(__name__)
+
 
 def require_app(func):
     @wraps(func)
@@ -31,6 +35,7 @@ def require_app(func):
         if not inst.app:
             raise RuntimeError("Connect to an application first to use %s" % func.__name__)
         return func(inst, *args, **kwargs)
+
     return wrapper
 
 
@@ -87,7 +92,12 @@ class Windows(Device):
             self.app = self._app.connect(**kwargs)
             self._top_window = self.app.top_window().wrapper_object()
         if kwargs.get("foreground", True) in (True, "True", "true"):
-            self.set_foreground()
+            try:
+                self.set_foreground()
+            except pywintypes.error as e:
+                # pywintypes.error: (0, 'SetForegroundWindow', 'No error message is available')
+                # If you are not running with administrator privileges, it may fail, but this error can be ignored.
+                pass
 
     def shell(self, cmd):
         """
@@ -104,6 +114,40 @@ class Windows(Device):
 
         """
         return subprocess.check_output(cmd, shell=True)
+
+    def snapshot_old(self, filename=None, quality=10, max_size=None):
+        """
+        Take a screenshot and save it in ST.LOG_DIR folder
+
+        Args:
+            filename: name of the file to give to the screenshot, {time}.jpg by default
+            quality: The image quality, integer in range [1, 99]
+            max_size: the maximum size of the picture, e.g 1200
+
+        Returns:
+            display the screenshot
+
+        """
+        if self.handle:
+            screen = screenshot(filename, self.handle)
+        else:
+            screen = screenshot(filename)
+            if self.app:
+                rect = self.get_rect()
+                rect = self._fix_image_rect(rect)
+                screen = aircv.crop_image(screen, [rect.left, rect.top, rect.right, rect.bottom])
+        if not screen.any():
+            if self.app:
+                rect = self.get_rect()
+                rect = self._fix_image_rect(rect)
+                screen = aircv.crop_image(screenshot(filename), [rect.left, rect.top, rect.right, rect.bottom])
+        if self._focus_rect != (0, 0, 0, 0):
+            height, width = screen.shape[:2]
+            rect = (self._focus_rect[0], self._focus_rect[1], width + self._focus_rect[2], height + self._focus_rect[3])
+            screen = aircv.crop_image(screen, rect)
+        if filename:
+            aircv.imwrite(filename, screen, quality, max_size=max_size)
+        return screen
 
     def snapshot(self, filename=None, quality=10, max_size=None):
         """
@@ -125,12 +169,16 @@ class Windows(Device):
                        "height": rect.bottom - rect.top, "monitor": 1}
         else:
             monitor = self.screen.monitors[0]
-        with mss.mss() as sct:
-            sct_img = sct.grab(monitor)
-            screen = numpy.array(sct_img, dtype=numpy.uint8)[...,:3]
-            if filename:
-                aircv.imwrite(filename, screen, quality, max_size=max_size)
-            return screen
+        try:
+            with mss.mss() as sct:
+                sct_img = sct.grab(monitor)
+                screen = numpy.array(sct_img, dtype=numpy.uint8)[..., :3]
+                if filename:
+                    aircv.imwrite(filename, screen, quality, max_size=max_size)
+                return screen
+        except:
+            # if mss.exception.ScreenShotError: gdi32.GetDIBits() failed.
+            return self.snapshot_old(filename, quality, max_size)
 
     def _fix_image_rect(self, rect):
         """Fix rect in image."""
@@ -233,6 +281,12 @@ class Windows(Device):
             pos: coordinates where to click
             **kwargs: optional arguments
 
+        Examples:
+            >>> from airtest.core.api import connect_device
+            >>> dev = connect_device("Windows:///")
+            >>> dev.touch((100, 100))  # absolute coordinates
+            >>> dev.touch((0.5, 0.5))  # relative coordinates
+
         Returns:
             None
 
@@ -244,7 +298,8 @@ class Windows(Device):
         offset = kwargs.get("offset", 0)
 
         start = self._action_pos(win32api.GetCursorPos())
-        end = self._action_pos(pos)
+        ori_end = get_absolute_coordinate(pos, self)
+        end = self._action_pos(ori_end)
         start_x, start_y = self._fix_op_pos(start)
         end_x, end_y = self._fix_op_pos(end)
 
@@ -252,31 +307,33 @@ class Windows(Device):
         time.sleep(interval)
 
         for i in range(1, steps):
-            x = int(start_x + (end_x-start_x) * i / steps)
-            y = int(start_y + (end_y-start_y) * i / steps)
+            x = int(start_x + (end_x - start_x) * i / steps)
+            y = int(start_y + (end_y - start_y) * i / steps)
             self.mouse.move(coords=(x, y))
             time.sleep(interval)
 
         self.mouse.move(coords=(end_x, end_y))
 
-        for i in range(1, offset+1):
-            self.mouse.move(coords=(end_x+i, end_y+i))
+        for i in range(1, offset + 1):
+            self.mouse.move(coords=(end_x + i, end_y + i))
             time.sleep(0.01)
 
         for i in range(offset):
-            self.mouse.move(coords=(end_x+offset-i, end_y+offset-i))
+            self.mouse.move(coords=(end_x + offset - i, end_y + offset - i))
             time.sleep(0.01)
 
         self.mouse.press(button=button, coords=(end_x, end_y))
         time.sleep(duration)
         self.mouse.release(button=button, coords=(end_x, end_y))
+        return ori_end
 
     def double_click(self, pos):
-        pos = self._fix_op_pos(pos)
-        coords = self._action_pos(pos)
+        ori_pos = get_absolute_coordinate(pos, self)
+        coords = self._fix_op_pos(self._action_pos(ori_pos))
         self.mouse.double_click(coords=coords)
+        return ori_pos
 
-    def swipe(self, p1, p2, duration=0.8, steps=5):
+    def swipe(self, p1, p2, duration=0.8, steps=5, button="left"):
         """
         Perform swipe (mouse press and mouse release)
 
@@ -285,20 +342,26 @@ class Windows(Device):
             p2: end point
             duration: time interval to perform the swipe action
             steps: size of the swipe step
+            button: mouse button to press, 'left', 'right' or 'middle', default is 'left'
+
+        Examples:
+            >>> from airtest.core.api import connect_device
+            >>> dev = connect_device("Windows:///")
+            >>> dev.swipe((100, 100), (200, 200), duration=0.5)
+            >>> dev.swipe((0.1, 0.1), (0.2, 0.2), duration=0.5)
 
         Returns:
             None
 
         """
         # 设置坐标时相对于整个屏幕的坐标:
-        x1, y1 = self._fix_op_pos(p1)
-        x2, y2 = self._fix_op_pos(p2)
-
-        from_x, from_y = self._action_pos(p1)
-        to_x, to_y = self._action_pos(p2)
+        ori_from = get_absolute_coordinate(p1, self)
+        ori_to = get_absolute_coordinate(p2, self)
+        from_x, from_y = self._fix_op_pos(self._action_pos(ori_from))
+        to_x, to_y = self._fix_op_pos(self._action_pos(ori_to))
 
         interval = float(duration) / (steps + 1)
-        self.mouse.press(coords=(from_x, from_y))
+        self.mouse.press(coords=(from_x, from_y), button=button)
         time.sleep(interval)
         for i in range(1, steps):
             self.mouse.move(coords=(
@@ -309,7 +372,8 @@ class Windows(Device):
         for i in range(10):
             self.mouse.move(coords=(to_x, to_y))
         time.sleep(interval)
-        self.mouse.release(coords=(to_x, to_y))
+        self.mouse.release(coords=(to_x, to_y), button=button)
+        return ori_from, ori_to
 
     def mouse_move(self, pos):
         """Simulates a `mousemove` event.
@@ -394,7 +458,9 @@ class Windows(Device):
             None
 
         """
-        SetForegroundWindow(self._top_window)
+        self._top_window.set_focus()
+
+    set_focus = set_foreground
 
     def get_rect(self):
         """
@@ -457,6 +523,63 @@ class Windows(Device):
         """
         self.app.kill()
 
+    def set_clipboard(self, text):
+        """
+        Set clipboard content
+
+        Args:
+            text: text to be set to clipboard
+
+        Examples:
+
+            >>> from airtest.core.api import connect_device
+            >>> dev = connect_device("Windows:///")
+            >>> dev.set_clipboard("hello world")
+            >>> print(dev.get_clipboard())
+            'hello world'
+            >>> dev.paste()  # paste the clipboard content
+
+        Returns:
+            None
+
+        """
+        try:
+            win32clipboard.OpenClipboard()
+        except pywintypes.error as e:
+            # pywintypes.error: (5, 'OpenClipboard', '拒绝访问。')
+            # sometimes clipboard is locked by other process, retry after 0.1s
+            time.sleep(0.1)
+            win32clipboard.OpenClipboard()
+        try:
+            win32clipboard.EmptyClipboard()
+            win32clipboard.SetClipboardData(win32clipboard.CF_UNICODETEXT, text)
+        finally:
+            win32clipboard.CloseClipboard()
+
+    def get_clipboard(self):
+        """
+        Get clipboard content
+
+        Returns:
+            clipboard content
+
+        """
+        try:
+            win32clipboard.OpenClipboard()
+            return win32clipboard.GetClipboardData()
+        finally:
+            win32clipboard.CloseClipboard()
+
+    def paste(self):
+        """
+        Perform paste action
+
+        Returns:
+            None
+
+        """
+        self.keyevent("^v")
+
     def _action_pos(self, pos):
         if self.app:
             pos = self._windowpos_to_screenpos(pos)
@@ -506,30 +629,45 @@ class Windows(Device):
         Returns:
              :py:obj:`str`: ip address
         """
-        hostname = socket.getfqdn()
-        return socket.gethostbyname_ex(hostname)[2][0]
+        ifaces = psutil.net_if_addrs()
+        # 常见的虚拟网卡名称关键词
+        virtual_iface_keywords = ['vEthernet', 'VirtualBox', 'VMware', 'Hyper-V', 'Wireless', 'VPN', 'Loopback']
 
-    def start_recording(self, max_time=1800, output=None, fps=10, mode="ffmpeg",
-                        snapshot_sleep=0.001, orientation=0):
+        for interface_name, iface_addresses in ifaces.items():
+            if any(keyword in interface_name for keyword in virtual_iface_keywords):
+                continue
+
+            for iface_address in iface_addresses:
+                # 检查IPV4地址
+                if iface_address.family == socket.AF_INET:
+                    # 检查是否为自动获取的APIPA地址
+                    if not iface_address.address.startswith('169.254'):
+                        # 返回第一个非APIPA的IPV4地址
+                        return iface_address.address
+
+        return None
+
+    def start_recording(self, max_time=1800, output=None, fps=10,
+                        snapshot_sleep=0.001, orientation=0, max_size=None, *args, **kwargs):
         """
         Start recording the device display
 
         Args:
             max_time: maximum screen recording time, default is 1800
             output: ouput file path
-            mode: the backend write video, choose in ["ffmpeg", "cv2"]
+            mode: the backend write video, choose in ["ffmpeg"]
                 ffmpeg: ffmpeg-python backend, higher compression rate.
-                cv2: cv2.VideoWriter backend, more stable.
             fps: frames per second will record
             snapshot_sleep: sleep time for each snapshot.
             orientation: 1: portrait, 2: landscape, 0: rotation.
+            max_size: max size of the video frame, e.g.800, default is None. Smaller sizes lead to lower system load.
 
         Returns:
             save_path: path of video file
 
         Examples:
 
-            Record 30 seconds of video and export to the current directory test.mp4::
+            Record 30 seconds of video and export to the current directory test.mp4:
 
             >>> from airtest.core.api import connect_device, sleep
             >>> dev = connect_device("Windows:///")
@@ -537,6 +675,10 @@ class Windows(Device):
             >>> sleep(30)
             >>> dev.stop_recording()
             >>> print(save_path)
+
+            You can specify max_size to limit the video's maximum width/length. Smaller video sizes result in lower CPU load.
+
+            >>> dev.start_recording(output="test.mp4", max_size=800)
 
         Note:
             1 Don't resize the app window duraing recording, the recording region will be limited by first frame.
@@ -554,27 +696,40 @@ class Windows(Device):
             if self.recorder.is_running():
                 LOGGING.warning("recording is already running, please don't call again")
                 return None
-        
+
         logdir = "./"
         if not ST.LOG_DIR is None:
             logdir = ST.LOG_DIR
         if output is None:
-            save_path = os.path.join(logdir, "screen_%s.mp4"%(time.strftime("%Y%m%d%H%M%S", time.localtime())))
+            save_path = os.path.join(logdir, "screen_%s.mp4" % (time.strftime("%Y%m%d%H%M%S", time.localtime())))
         else:
             if os.path.isabs(output):
                 save_path = output
             else:
                 save_path = os.path.join(logdir, output)
 
+        max_size = get_max_size(max_size)
+
+        def get_frame():
+            try:
+                frame = self.snapshot()
+            except numpy.core._exceptions._ArrayMemoryError:
+                self.stop_recording()
+                raise Exception("memory error!!!!")
+
+            if max_size is not None:
+                frame = resize_by_max(frame, max_size)
+            return frame
+
         self.recorder = ScreenRecorder(
-            save_path, self.snapshot, mode=mode, fps=fps,
+            save_path, get_frame, fps=fps,
             snapshot_sleep=snapshot_sleep, orientation=orientation)
         self.recorder.stop_time = max_time
         self.recorder.start()
         LOGGING.info("start recording screen to {}, don't close or resize the app window".format(save_path))
         return save_path
 
-    def stop_recording(self,):
+    def stop_recording(self):
         """
         Stop recording the device display. Recoding file will be kept in the device.
 

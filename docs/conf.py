@@ -41,12 +41,13 @@ from recommonmark.parser import CommonMarkParser
 
 import mock
 
-mock_list = ['cv2', 'Xlib', 'numpy', 'mss', 'wda']
+mock_list = ['cv2', 'Xlib', 'numpy', 'mss', 'wda', 'ffmpeg', 'logzero', 'PIL', 'psutil']
 win_mock_list = [
             'win32api',
             'win32con',
             'win32gui',
             'win32ui',
+            'win32clipboard',
             'pywinauto',
             'pywintypes',
             'pywinauto.application',
@@ -54,7 +55,9 @@ win_mock_list = [
             'pywinauto.win32structures',
             'airtest.core.win.ctypesinput'
             ]
-for mod_name in mock_list + win_mock_list:
+ios_mock_list = [
+    'tidevice', 'tidevice._usbmux', 'tidevice._device', 'tidevice._proto', 'tidevice.exceptions', ]
+for mod_name in mock_list + win_mock_list + ios_mock_list:
     sys.modules[mod_name] = mock.MagicMock()
 
 sys.modules["cv2"].__version__ = "3.2.0.7"

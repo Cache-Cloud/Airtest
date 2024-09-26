@@ -9,6 +9,7 @@ import traceback
 from copy import copy
 from .logger import get_logger
 from .snippet import reg_cleanup
+from airtest.core.error import LocalDeviceError
 LOGGING = get_logger(__name__)
 
 
@@ -36,7 +37,10 @@ class AirtestLogger(object):
     @staticmethod
     def _dumper(obj):
         if hasattr(obj, "to_json"):
-            return obj.to_json()
+            try:
+                return obj.to_json()
+            except:
+                repr(obj)
         try:
             d = copy(obj.__dict__)
             try:
@@ -75,7 +79,11 @@ class AirtestLogger(object):
         while self.running_stack:
             # 先取最后一个，记了log之后再pop，避免depth错误
             log_stacked = self.running_stack[-1]
-            self.log("function", log_stacked)
+            try:
+                self.log("function", log_stacked)
+            except Exception as e:
+                LOGGING.error("log_stacked error: %s" % e)
+                LOGGING.error(traceback.format_exc())
             self.running_stack.pop()
 
 
@@ -118,10 +126,15 @@ def Logwrap(f, logger):
         # The snapshot parameter is popped from the function parameter,
         # so the function cannot use the parameter name snapshot later
         snapshot = m.pop('snapshot', False)
+        m.pop('self', None)  # remove self from the call_args
+        m.pop('cls', None)  # remove cls from the call_args
         fndata = {'name': f.__name__, 'call_args': m, 'start_time': start}
         logger.running_stack.append(fndata)
         try:
             res = f(*args, **kwargs)
+        except LocalDeviceError:
+            # 为了进入airtools中的远程方法，同时不让LocalDeviceError在报告中显示为失败步骤
+            raise LocalDeviceError
         except Exception as e:
             data = {"traceback": traceback.format_exc(), "end_time": time.time()}
             fndata.update(data)
@@ -138,5 +151,9 @@ def Logwrap(f, logger):
                     # if G.DEVICE is None
                     pass
             logger.log('function', fndata, depth=depth)
-            logger.running_stack.pop()
+            try:
+                logger.running_stack.pop()
+            except IndexError:
+                # logger.running_stack is empty
+                pass
     return wrapper

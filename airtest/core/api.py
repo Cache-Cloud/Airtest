@@ -5,12 +5,11 @@ This module contains the Airtest Core APIs.
 import os
 import time
 
-from six.moves.urllib.parse import parse_qsl, urlparse
-
 from airtest.core.cv import Template, loop_find, try_log_screen
 from airtest.core.error import TargetNotFoundError
 from airtest.core.settings import Settings as ST
 from airtest.utils.compat import script_log_dir
+from airtest.utils.snippet import parse_device_uri
 from airtest.core.helper import (G, delay_after_operation, import_device_cls,
                                  logwrap, set_logdir, using, log)
 # Assertions
@@ -46,6 +45,7 @@ def init_device(platform="Android", uuid=None, **kwargs):
     return dev
 
 
+@logwrap
 def connect_device(uri):
     """
     Initialize device with uri, and set as current device.
@@ -59,6 +59,7 @@ def connect_device(uri):
         >>> connect_device("Android:///SJE5T17B17?cap_method=javacap&touch_method=adb")
         >>> # remote device using custom params Android://adbhost:adbport/serialno
         >>> connect_device("Android://127.0.0.1:5037/10.254.60.1:5555")
+        >>> connect_device("Android://127.0.0.1:5037/10.234.60.1:5555?name=serialnumber")  # add serialno to params
         >>> connect_device("Windows:///")  # connect to the desktop
         >>> connect_device("Windows:///123456")  # Connect to the window with handle 123456
         >>> connect_device("windows:///?title_re='.*explorer.*'")  # Connect to the window that name include "explorer"
@@ -69,13 +70,7 @@ def connect_device(uri):
         >>> connect_device("iOS:///http://localhost:8100/?mjpeg_port=9100&&uuid=00008020-001270842E88002E")  # udid/uuid/serialno are all ok
 
     """
-    d = urlparse(uri)
-    platform = d.scheme
-    host = d.netloc
-    uuid = d.path.lstrip("/")
-    params = dict(parse_qsl(d.query))
-    if host:
-        params["host"] = host.split(":")
+    platform, uuid, params = parse_device_uri(uri)
     dev = init_device(platform, uuid, **params)
     return dev
 
@@ -138,12 +133,12 @@ def auto_setup(basedir=None, devices=None, logdir=None, project_root=None, compr
             basedir = os.path.dirname(basedir)
         if basedir not in G.BASEDIR:
             G.BASEDIR.append(basedir)
-    if devices:
-        for dev in devices:
-            connect_device(dev)
     if logdir:
         logdir = script_log_dir(basedir, logdir)
         set_logdir(logdir)
+    if devices:
+        for dev in devices:
+            connect_device(dev)
     if project_root:
         ST.PROJECT_ROOT = project_root
     if compress:
@@ -230,11 +225,15 @@ def install(filepath, **kwargs):
     :param filepath: the path to file to be installed on target device
     :param kwargs: platform specific `kwargs`, please refer to corresponding docs
     :return: None
-    :platforms: Android
+    :platforms: Android, iOS
     :Example:
-        >>> install(r"D:\\demo\\test.apk")
+        >>> install(r"D:\demo\test.apk")  # install Android apk
         >>> # adb install -r -t D:\\demo\\test.apk
-        >>> install(r"D:\\demo\\test.apk", install_options=["-r", "-t"])
+        >>> install(r"D:\demo\test.apk", install_options=["-r", "-t"])
+
+        >>> install(r"D:\demo\test.ipa") # install iOS ipa
+        >>> install("http://www.example.com/test.ipa") # install iOS ipa from url
+
     """
     return G.DEVICE.install_app(filepath, **kwargs)
 
@@ -246,7 +245,7 @@ def uninstall(package):
 
     :param package: name of the package, see also `start_app`
     :return: None
-    :platforms: Android
+    :platforms: Android, iOS
     :Example:
         >>> uninstall("com.netease.cloudmusic")
     """
@@ -346,6 +345,10 @@ def touch(v, times=1, **kwargs):
 
         >>> touch(Template(r"tpl1606730579419.png", target_pos=5))
 
+        Click on relative coordinates, for example, click on the center of the screen::
+
+        >>> touch((0.5, 0.5))
+
         Click 2 times::
 
         >>> touch((100, 100), times=2)
@@ -365,7 +368,9 @@ def touch(v, times=1, **kwargs):
         try_log_screen()
         pos = v
     for _ in range(times):
-        G.DEVICE.touch(pos, **kwargs)
+        # If pos is a relative coordinate, return the converted click coordinates.
+        # iOS may all use vertical screen coordinates, so coordinates will not be returned.
+        pos = G.DEVICE.touch(pos, **kwargs) or pos
         time.sleep(0.05)
     delay_after_operation()
     return pos
@@ -390,7 +395,7 @@ def double_click(v):
     else:
         try_log_screen()
         pos = v
-    G.DEVICE.double_click(pos)
+    pos = G.DEVICE.double_click(pos) or pos
     delay_after_operation()
     return pos
 
@@ -425,6 +430,10 @@ def swipe(v1, v2=None, vector=None, **kwargs):
         >>> # swiping lasts for 1 second, divided into 6 steps
         >>> swipe((100, 100), (200, 200), duration=1, steps=6)
 
+        Use relative coordinates to swipe, such as swiping from the center right to the left of the screen::
+
+        >>> swipe((0.7, 0.5), (0.2, 0.5))
+
     """
     if isinstance(v1, Template):
         try:
@@ -451,7 +460,7 @@ def swipe(v1, v2=None, vector=None, **kwargs):
     else:
         raise Exception("no enough params for swipe")
 
-    G.DEVICE.swipe(pos1, pos2, **kwargs)
+    pos1, pos2 = G.DEVICE.swipe(pos1, pos2, **kwargs) or (pos1, pos2)
     delay_after_operation()
     return pos1, pos2
 
@@ -658,6 +667,114 @@ def find_all(v):
     screen = G.DEVICE.snapshot(quality=ST.SNAPSHOT_QUALITY)
     return v.match_all_in(screen)
 
+
+@logwrap
+def get_clipboard(*args, **kwargs):
+    """
+    Get the content from the clipboard.
+
+    :return: str
+    :platforms: Android, iOS, Windows
+    :Example:
+
+        >>> text = get_clipboard()  # Android or local iOS
+        >>> print(text)
+
+        >>> # When the iOS device is a remote device, or more than one wda is installed on the device, you need to specify the wda_bundle_id
+        >>> text = get_clipboard(wda_bundle_id="com.WebDriverAgentRunner.xctrunner")
+        >>> print(text)
+
+    """
+    return G.DEVICE.get_clipboard(*args, **kwargs)
+
+
+@logwrap
+def set_clipboard(content, *args, **kwargs):
+    """
+    Set the content from the clipboard.
+
+    :param content: str
+    :return: None
+    :platforms: Android, iOS, Windows
+    :Example:
+
+        >>> set_clipboard("content")  # Android or local iOS
+        >>> print(get_clipboard())
+
+        >>> # When the iOS device is a remote device, or more than one wda is installed on the device, you need to specify the wda_bundle_id
+        >>> set_clipboard("content", wda_bundle_id="com.WebDriverAgentRunner.xctrunner")
+
+    """
+    G.DEVICE.set_clipboard(content, *args, **kwargs)
+
+
+@logwrap
+def paste(*args, **kwargs):
+    """
+    Paste the content from the clipboard.
+
+    :platforms: Android, iOS, Windows
+    :return: None
+    :Example:
+
+        >>> set_clipboard("content")
+        >>> paste()  # will paste "content" to the device
+
+    """
+    G.DEVICE.paste(*args, **kwargs)
+
+
+@logwrap
+def push(local, remote, *args, **kwargs):
+    """
+    Push file from local to remote
+
+    :param local: local file path
+    :param remote: remote file path
+    :return: filename of the pushed file
+    :platforms: Android, iOS
+    :Example:
+
+        Android::
+
+            >>> connect_device("android:///")
+            >>> push(r"D:\demo\test.text", "/data/local/tmp/test.text")
+
+
+        iOS::
+
+            >>> connect_device("iOS:///http+usbmux://udid")
+            >>> push("test.png", "/DCIM/")  # push to the DCIM directory
+            >>> push(r"D:\demo\test.text", "/Documents", bundle_id="com.apple.Keynote")  # push to the Documents directory of the Keynote app
+
+    """
+    return G.DEVICE.push(local, remote, *args, **kwargs)
+
+
+@logwrap
+def pull(remote, local, *args, **kwargs):
+    """
+    Pull file from remote to local
+
+    :param remote: remote file path
+    :param local: local file path
+    :return: filename of the pulled file
+    :platforms: Android, iOS
+    :Example:
+
+        Android::
+
+            >>> connect_device("android:///")
+            >>> pull("/data/local/tmp/test.txt", r"D:\demo\test.txt")
+
+        iOS::
+
+            >>> connect_device("iOS:///http+usbmux://udid")
+            >>> pull("/DCIM/test.png", r"D:\demo\test.png")
+            >>> pull("/Documents/test.key", r"D:\demo\test.key", bundle_id="com.apple.Keynote")
+
+    """
+    return G.DEVICE.pull(remote, local, *args, **kwargs)
 
 """
 Assertions: see airtest/core/assertions.py

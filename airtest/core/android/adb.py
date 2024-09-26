@@ -5,6 +5,7 @@ import sys
 import time
 import random
 import platform
+import psutil
 import warnings
 import subprocess
 import threading
@@ -20,9 +21,11 @@ from airtest.utils.compat import decode_path, raisefrom, proc_communicate_timeou
 from airtest.utils.logger import get_logger
 from airtest.utils.nbsp import NonBlockingStreamReader
 from airtest.utils.retry import retries
+from airtest.utils.apkparser import APK
 from airtest.utils.snippet import get_std_encoding, reg_cleanup, split_cmd, make_file_executable
 
 LOGGING = get_logger(__name__)
+TMP_PATH = "/data/local/tmp"  # Android's temporary file directory
 
 
 class ADB(object):
@@ -35,7 +38,7 @@ class ADB(object):
 
     def __init__(self, serialno=None, adb_path=None, server_addr=None, display_id=None, input_event=None):
         self.serialno = serialno
-        self.adb_path = adb_path or self.builtin_adb_path()
+        self.adb_path = adb_path or self.get_adb_path()
         self.display_id = display_id
         self.input_event = input_event
         self._set_cmd_options(server_addr)
@@ -46,6 +49,46 @@ class ADB(object):
         self._display_info_lock = threading.Lock()
         self._forward_local_using = []
         self.__class__._instances.append(self)
+
+    @staticmethod
+    def get_adb_path():
+        """
+        Returns the path to the adb executable.
+
+        Checks if adb process is running, returns the running process path.
+
+        If adb process is not running, checks if ANDROID_HOME environment variable is set.
+        Constructs the adb path using ANDROID_HOME and returns it if set.
+
+        If adb process is not running and ANDROID_HOME is not set, uses built-in adb path.
+
+        Returns:
+            str: The path to the adb executable.
+        """
+        if platform.system() == "Windows":
+            ADB_NAME = "adb.exe"
+        else:
+            ADB_NAME = "adb"
+
+        # Check if adb process is already running
+        try:
+            for process in psutil.process_iter(['name', 'exe']):
+                if process.info['name'] == ADB_NAME and process.info['exe'] and os.path.exists(process.info['exe']):
+                    return process.info['exe']
+        except:
+            # maybe OSError
+            pass
+
+        # Check if ANDROID_HOME environment variable exists
+        android_home = os.environ.get('ANDROID_HOME')
+        if android_home:
+            adb_path = os.path.join(android_home, 'platform-tools', ADB_NAME)
+            if os.path.exists(adb_path):
+                return adb_path
+
+        # Use airtest builtin adb path
+        builtin_adb_path = ADB.builtin_adb_path()
+        return builtin_adb_path
 
     @staticmethod
     def builtin_adb_path():
@@ -64,9 +107,6 @@ class ADB(object):
         if not adb_path:
             raise RuntimeError("No adb executable supports this platform({}-{}).".format(system, machine))
 
-        # overwrite uiautomator adb
-        if "ANDROID_HOME" in os.environ:
-            del os.environ["ANDROID_HOME"]
         if system != "Windows":
             # chmod +x adb
             make_file_executable(adb_path)
@@ -219,7 +259,7 @@ class ADB(object):
             list od adb devices
 
         """
-        patten = re.compile(r'^[\w\d.:-]+\t[\w]+$')
+        patten = re.compile(r'[\w\d.:-]+\t[\w]+$')
         device_list = []
         # self.start_server()
         output = self.cmd("devices", device=False)
@@ -431,16 +471,10 @@ class ADB(object):
 
     def push(self, local, remote):
         """
-        Perform `adb push` command
-
-        Note:
-            If there is a space (or special symbol) in the file name, it will be forced to add escape characters,
-            and the new file name will be added with quotation marks and returned as the return value
-
-            注意：文件名中如果带有空格（或特殊符号），将会被强制增加转义符，并将新的文件名添加引号，作为返回值返回
+        Push file or folder to the specified directory to the device
 
         Args:
-            local: local file to be copied to the device
+            local: local file or folder to be copied to the device
             remote: destination on the device where the file will be copied
 
         Returns:
@@ -456,18 +490,65 @@ class ADB(object):
             "/data/local/tmp/test\ space.txt"
             >>> adb.shell("rm " + new_name)
 
-        """
-        local = decode_path(local)  # py2
-        if os.path.isfile(local) and os.path.splitext(local)[-1] != os.path.splitext(remote)[-1]:
-            # If remote is a folder, add the filename and escape
-            filename = os.path.basename(local)
-            # Add escape characters for spaces, parentheses, etc. in filenames
-            filename = re.sub(r"[ \(\)\&]", lambda m: "\\" + m.group(0), filename)
-            remote = '%s/%s' % (remote, filename)
-        self.cmd(["push", local, remote], ensure_unicode=False)
-        return '\"%s\"' % remote
+            >>> adb.push("test_dir", "/sdcard/Android/data/com.test.package/files")
+            >>> adb.push("test_dir", "/sdcard/Android/data/com.test.package/files/test_dir")
 
-    def pull(self, remote, local):
+        """
+        _, ext = os.path.splitext(remote)
+        if ext:
+            # The target path is a file
+            dst_parent = os.path.dirname(remote)
+        else:
+            dst_parent = remote
+
+        # If the target file already exists, delete it first to avoid overwrite failure
+        src_filename = os.path.basename(local)
+        _, src_ext = os.path.splitext(local)
+        if src_ext:
+            dst_path = f"{dst_parent}/{src_filename}"
+        else:
+            if src_filename == os.path.basename(remote):
+                dst_path = remote
+            else:
+                dst_path = f"{dst_parent}/{src_filename}"
+        try:
+            self.shell(f"rm -r {dst_path}")
+        except:
+            pass
+
+        # If the target folder has multiple levels that have never been created, try to create them
+        try:
+            self.shell(f"mkdir -p {dst_parent}")
+        except:
+            pass
+
+        # Push the file to the tmp directory to avoid permission issues
+        tmp_path = f"{TMP_PATH}/{src_filename}"
+        try:
+            self.cmd(["push", local, tmp_path])
+        except:
+            self.cmd(["push", local, dst_parent])
+        else:
+            try:
+                if src_ext:
+                    try:
+                        self.shell(f'mv "{tmp_path}" "{remote}"')
+                    except:
+                        self.shell(f'mv "{tmp_path}" "{remote}"')
+                else:
+                    try:
+                        self.shell(f'cp -frp "{tmp_path}/*" "{remote}"')
+                    except:
+                        self.shell(f'mv "{tmp_path}" "{remote}"')
+            finally:
+                try:
+                    if TMP_PATH != dst_parent:
+                        self.shell(f'rm -r "{tmp_path}"')
+                except:
+                    pass
+        return dst_path
+
+    def pull(self, remote, local=""):
         """
         Perform `adb pull` command
 
@@ -482,6 +563,8 @@ class ADB(object):
         Returns:
             None
         """
+        if not local:
+            local = os.path.basename(remote)
         local = decode_path(local)  # py2
         if PY3:
             # If python3, use Path to force / convert to \
@@ -583,9 +666,11 @@ class ADB(object):
         try:
             self.cmd(cmds)
         except AdbError as e:
-            # ignore if already removed
-            if "not found" in e.stdout:
+            # ignore if already removed or disconnected
+            if "not found" in (repr(e.stdout) + repr(e.stderr)):
                 pass
+        except DeviceConnectionError:
+            pass
         # unregister for cleanup
         if local in self._forward_local_using:
             self._forward_local_using.remove(local)
@@ -620,7 +705,21 @@ class ADB(object):
         if replace:
             install_options.append("-r")
         cmds = ["install", ] + install_options + [filepath, ]
-        out = self.cmd(cmds)
+        try:
+            out = self.cmd(cmds)
+        except AdbError as e:
+            out = repr(e.stderr) + repr(e.stdout)
+            # If the signatures are inconsistent, uninstall the old version first
+            if "INSTALL_FAILED_UPDATE_INCOMPATIBLE" in out and replace:
+                try:
+                    package_name = re.search(r"package (.*?) .*", out).group(1)
+                except:
+                    # get package name
+                    package_name = APK(filepath).get_package()
+                self.uninstall_app(package_name)
+                out = self.cmd(cmds)
+            else:
+                raise
 
         if re.search(r"Failure \[.*?\]", out):
             raise AdbShellError("Installation Failure", repr(out))
@@ -716,8 +815,19 @@ class ADB(object):
         try:
             cmds = ["pm", "install", ] + install_options + [device_path]
             self.shell(cmds)
-        except:
-            raise
+        except AdbError as e:
+            out = repr(e.stderr) + repr(e.stdout)
+            # If the signatures are inconsistent, uninstall the old version first
+            if re.search(r"INSTALL_FAILED_UPDATE_INCOMPATIBLE", out):
+                try:
+                    package_name = re.search(r"package (.*?) .*", out).group(1)
+                except:
+                    # get package name
+                    package_name = APK(filepath).get_package()
+                self.uninstall_app(package_name)
+                out = self.shell(cmds)
+            else:
+                raise
         finally:
             # delete apk file
             self.cmd(["shell", "rm", device_path], timeout=30)
@@ -855,8 +965,8 @@ class ADB(object):
 
         """
         try:
-            out = self.shell(["ls", filepath])
-        except AdbShellError:
+            out = self.shell("ls \"%s\"" % filepath)
+        except (AdbShellError, AdbError):
             return False
         else:
             return not ("No such file or directory" in out)
@@ -1114,6 +1224,12 @@ class ADB(object):
         if m:
             return int(m.group(1))
 
+        displayFramesRE = re.compile(r"DisplayFrames.*r=(\d+)")
+        output = self.shell('dumpsys window displays')
+        m = displayFramesRE.search(output)
+        if m:
+            return int(m.group(1))
+
         # We couldn't obtain the orientation
         warnings.warn("Could not obtain the orientation, return 0")
         return 0
@@ -1214,6 +1330,7 @@ class ADB(object):
                 return m.group(1) == 'SCREEN_STATE_ON'
         raise AirtestError("Couldn't determine screen ON state")
 
+    @retries(max_tries=3)
     def is_locked(self):
         """
         Perform `adb shell dumpsys window policy` command and search for information if screen is locked or not
@@ -1352,7 +1469,12 @@ class ADB(object):
 
         """
         if not activity:
-            self.shell(['monkey', '-p', package, '-c', 'android.intent.category.LAUNCHER', '1'])
+            try:
+                ret = self.shell(['monkey', '-p', package, '-c', 'android.intent.category.LAUNCHER', '1'])
+            except AdbShellError as e:
+                raise AirtestError("Starting App: %s Failed! No activities found to run." % package)
+            if "No activities found to run" in ret:
+                raise AirtestError("Starting App: %s Failed! No activities found to run." % package)
         else:
             self.shell(['am', 'start', '-n', '%s/%s.%s' % (package, package, activity)])
 
@@ -1582,7 +1704,7 @@ class ADB(object):
         res = self.shell("cat /proc/cpuinfo").strip()
         cpuNum = res.count("processor")
         pat = re.compile(r'Hardware\s+:\s+(\w+.*)')
-        m = pat.match(res)
+        m = pat.search(res)
         if not m:
             pat = re.compile(r'Processor\s+:\s+(\w+.*)')
             m = pat.match(res)

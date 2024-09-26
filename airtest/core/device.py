@@ -18,6 +18,13 @@ class Device(with_metaclass(MetaDevice, object)):
     def __init__(self):
         super(Device, self).__init__()
 
+    def to_json(self):
+        try:
+            uuid = repr(self.uuid)
+        except:
+            uuid = None
+        return f"<{self.__class__.__name__} {uuid}>"
+
     @property
     def uuid(self):
         self._raise_not_implemented_error()
@@ -69,6 +76,15 @@ class Device(with_metaclass(MetaDevice, object)):
 
     def get_ip_address(self):
         self._raise_not_implemented_error()
+
+    def set_clipboard(self, text):
+        self._raise_not_implemented_error()
+
+    def get_clipboard(self):
+        self._raise_not_implemented_error()
+
+    def paste(self):
+        self.text(self.get_clipboard())
 
     def _raise_not_implemented_error(self):
         platform = self.__class__.__name__

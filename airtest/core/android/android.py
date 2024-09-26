@@ -8,6 +8,7 @@ from copy import copy
 from airtest import aircv
 from airtest.core.device import Device
 from airtest.core.android.ime import YosemiteIme
+from airtest.core.android.yosemite_ext import YosemiteExt
 from airtest.core.android.constant import CAP_METHOD, TOUCH_METHOD, IME_METHOD, ORI_METHOD, \
     SDK_VERISON_ANDROID10
 from airtest.core.android.adb import ADB
@@ -25,7 +26,8 @@ from airtest.core.android.touch_methods.minitouch import Minitouch  # noqa
 from airtest.core.android.touch_methods.maxtouch import Maxtouch  # noqa
 
 from airtest.core.settings import Settings as ST
-from airtest.aircv.screen_recorder import ScreenRecorder
+from airtest.aircv.screen_recorder import ScreenRecorder, resize_by_max, get_max_size
+from airtest.utils.snippet import get_absolute_coordinate
 from airtest.utils.logger import get_logger
 
 LOGGING = get_logger(__name__)
@@ -40,9 +42,12 @@ class Android(Device):
                  ime_method=IME_METHOD.YOSEMITEIME,
                  ori_method=ORI_METHOD.MINICAP,
                  display_id=None,
-                 input_event=None):
+                 input_event=None,
+                 adb_path=None,
+                 name=None):
         super(Android, self).__init__()
-        self.serialno = serialno or self.get_default_device()
+        self.serialno = serialno or self.get_default_device(adb_path=adb_path)
+        self._uuid = name or self.serialno
         self._cap_method = cap_method.upper()
         self._touch_method = touch_method.upper()
         self.ime_method = ime_method.upper()
@@ -50,7 +55,7 @@ class Android(Device):
         self.display_id = display_id
         self.input_event = input_event
         # init adb
-        self.adb = ADB(self.serialno, server_addr=host, display_id=self.display_id, input_event=self.input_event)
+        self.adb = ADB(self.serialno, adb_path=adb_path, server_addr=host, display_id=self.display_id, input_event=self.input_event)
         self.adb.wait_for_device()
         self.sdk_version = self.adb.sdk_version
         if self.sdk_version >= SDK_VERISON_ANDROID10 and self._touch_method == TOUCH_METHOD.MINITOUCH:
@@ -61,6 +66,7 @@ class Android(Device):
         self.rotation_watcher = RotationWatcher(self.adb, self.ori_method)
         self.yosemite_ime = YosemiteIme(self.adb)
         self.yosemite_recorder = Recorder(self.adb)
+        self.yosemite_ext = YosemiteExt(self.adb)
         self._register_rotation_watcher()
 
         self._touch_proxy = None
@@ -94,6 +100,39 @@ class Android(Device):
                                                   input_event=self.input_event)
         return self._touch_proxy
 
+    @touch_proxy.setter
+    def touch_proxy(self, touch_method):
+        """
+        Specify a touch method, if the method fails to initialize, try to use other methods instead
+
+        指定一个触摸方案，如果该方法初始化失败，则尝试使用其他方法代替
+
+        Args:
+            touch_method: "MINITOUCH" or Minitouch() object
+
+        Returns:
+            TouchProxy object
+
+        Raises:
+            TouchMethodNotSupportedError when the connection fails
+
+        Examples:
+            >>> dev = Android()
+            >>> dev.touch_proxy = "MINITOUCH"
+
+            >>> from airtest.core.android.touch_methods.minitouch import Minitouch
+            >>> minitouch = Minitouch(dev.adb)
+            >>> dev.touch_proxy = minitouch
+
+        """
+        if self._screen_proxy:
+            self._screen_proxy.teardown()
+        self._touch_proxy = TouchProxy.auto_setup(self.adb,
+                                                  default_method=touch_method,
+                                                  ori_transformer=self._touch_point_by_orientation,
+                                                  size_info=self.display_info,
+                                                  input_event=self.input_event)
+
     @property
     def touch_method(self):
         """
@@ -110,6 +149,29 @@ class Android(Device):
 
         """
         return self.touch_proxy.method_name
+
+    @touch_method.setter
+    def touch_method(self, name):
+        """
+        Specify the touch method for the device, but this is not recommended
+        为设备指定触摸方案，但不建议这样做
+
+        Just to be compatible with some old codes
+        仅为了兼容一些旧的代码
+
+        Args:
+            name: "MINITOUCH" or Minitouch() object
+
+        Returns:
+            None
+
+        Examples:
+            >>> dev = Android()
+            >>> dev.touch_method = "MINITOUCH"
+
+        """
+        warnings.warn("No need to manually specify touch_method, airtest will automatically specify a suitable touch method, when airtest>=1.1.2")
+        self.touch_proxy = name
 
     @property
     def cap_method(self):
@@ -237,7 +299,7 @@ class Android(Device):
                       DeprecationWarning)
         return getattr(self, new_name)
 
-    def get_default_device(self):
+    def get_default_device(self, adb_path=None):
         """
         Get local default device when no serialno
 
@@ -245,9 +307,9 @@ class Android(Device):
             local device serialno
 
         """
-        if not ADB().devices(state="device"):
+        if not ADB(adb_path=adb_path).devices(state="device"):
             raise IndexError("ADB devices not found")
-        return ADB().devices(state="device")[0][0]
+        return ADB(adb_path=adb_path).devices(state="device")[0][0]
 
     @property
     def uuid(self):
@@ -256,7 +318,7 @@ class Android(Device):
 
         :return:
         """
-        ult = [self.serialno]
+        ult = [self._uuid]
         if self.display_id:
             ult.append(self.display_id)
         if self.input_event:
@@ -287,6 +349,7 @@ class Android(Device):
             the full path to the package
 
         """
+        assert package, "package name should not be empty"
         return self.adb.path_app(package)
 
     def check_app(self, package):
@@ -303,6 +366,7 @@ class Android(Device):
              AirtestError: raised if package is not found
 
         """
+        assert package, "package name should not be empty"
         return self.adb.check_app(package)
 
     def start_app(self, package, activity=None):
@@ -317,6 +381,7 @@ class Android(Device):
             None
 
         """
+        assert package, "package name should not be empty"
         return self.adb.start_app(package, activity)
 
     def start_app_timing(self, package, activity):
@@ -331,6 +396,7 @@ class Android(Device):
             app launch time
 
         """
+        assert package, "package name should not be empty"
         return self.adb.start_app_timing(package, activity)
 
     def stop_app(self, package):
@@ -344,6 +410,7 @@ class Android(Device):
             None
 
         """
+        assert package, "package name should not be empty"
         return self.adb.stop_app(package)
 
     def clear_app(self, package):
@@ -357,6 +424,7 @@ class Android(Device):
             None
 
         """
+        assert package, "package name should not be empty"
         return self.adb.clear_app(package)
 
     def install_app(self, filepath, replace=False, install_options=None):
@@ -399,6 +467,7 @@ class Android(Device):
             output from the uninstallation process
 
         """
+        assert package, "package name should not be empty"
         return self.adb.uninstall_app(package)
 
     def snapshot(self, filename=None, ensure_orientation=True, quality=10, max_size=None):
@@ -484,7 +553,7 @@ class Android(Device):
         Input text on the device
 
         Args:
-            text: text to input
+            text: text to input, will automatically replace single quotes with double quotes
             enter: True or False whether to press `Enter` key
             search: True or False whether to press `Search` key on IME after input
 
@@ -520,16 +589,25 @@ class Android(Device):
             pos: coordinates (x, y)
             duration: how long to touch the screen
 
+        Examples:
+            >>> dev = Android()  # or dev = device()
+            >>> dev.touch((100, 100))  # absolute coordinates
+            >>> dev.touch((0.5, 0.5))  # relative coordinates
+
         Returns:
-            None
+            (x, y)  # The coordinate position of the actual click
 
         """
+        pos = get_absolute_coordinate(pos, self)
         self.touch_proxy.touch(pos, duration)
+        return pos
 
     def double_click(self, pos):
+        pos = get_absolute_coordinate(pos, self)
         self.touch(pos)
         time.sleep(0.05)
         self.touch(pos)
+        return pos
 
     def swipe(self, p1, p2, duration=0.5, steps=5, fingers=1):
         """
@@ -542,11 +620,19 @@ class Android(Device):
             steps: how big is the swipe step, default 5
             fingers: the number of fingers. 1 or 2.
 
+        Examples:
+            >>> dev = Android()  # or dev = device()
+            >>> dev.swipe((100, 100), (200, 200))  # absolute coordinates
+            >>> dev.swipe((0.1, 0.1), (0.2, 0.2))  # relative coordinates
+
         Returns:
-            None
+            (pos1, pos2)
 
         """
+        p1 = get_absolute_coordinate(p1, self)
+        p2 = get_absolute_coordinate(p2, self)
         self.touch_proxy.swipe(p1, p2, duration=duration, steps=steps, fingers=fingers)
+        return p1, p2
 
     def pinch(self, center=None, percent=0.5, duration=0.5, steps=5, in_or_out='in'):
         """
@@ -581,6 +667,7 @@ class Android(Device):
             None
 
         """
+        coordinates_list = [get_absolute_coordinate(pos, self) for pos in coordinates_list]
         self.touch_proxy.swipe_along(coordinates_list, duration=duration, steps=steps)
 
     def two_finger_swipe(self, tuple_from_xy, tuple_to_xy, duration=0.8, steps=5, offset=(0, 50)):
@@ -597,6 +684,8 @@ class Android(Device):
         Returns:
             None
         """
+        tuple_from_xy = get_absolute_coordinate(tuple_from_xy, self)
+        tuple_to_xy = get_absolute_coordinate(tuple_to_xy, self)
         self.touch_proxy.two_finger_swipe(tuple_from_xy, tuple_to_xy, duration=duration, steps=steps, offset=offset)
 
     def logcat(self, *args, **kwargs):
@@ -785,29 +874,31 @@ class Android(Device):
         return x, y, w, h
 
     def start_recording(self, max_time=1800, output=None, fps=10, mode="yosemite",
-                        snapshot_sleep=0.001, orientation=0, bit_rate_level=None, bit_rate=None):
+                        snapshot_sleep=0.001, orientation=0, bit_rate_level=None, 
+                        bit_rate=None, max_size=None, *args, **kwargs):
         """
         Start recording the device display
 
         Args:
             max_time: maximum screen recording time, default is 1800
             output: ouput file path
-            mode: the backend write video, choose in ["ffmpeg", "cv2"]
-                yosemite: yosemite backend, higher quality.
-                ffmpeg: ffmpeg-python backend, higher compression rate.
-                cv2: cv2.VideoWriter backend, more stable.
+            mode: the backend write video, choose in ["ffmpeg", "yosemite"]
+                yosemite: (default method) High clarity but large file size and limited phone compatibility.
+                ffmpeg: Lower image quality but smaller files and better compatibility.
             fps: frames per second will record
-            snapshot_sleep: sleep time for each snapshot.
+            snapshot_sleep: (mode="ffmpeg" only) sleep time for each snapshot.
             orientation: 1: portrait, 2: landscape, 0: rotation, default is 0
-            bit_rate_level: bit_rate=resolution*level, 0 < level <= 5, default is 1
-            bit_rate: the higher the bitrate, the clearer the video
+            bit_rate_level: (mode="yosemite" only) bit_rate=resolution*level, 0 < level <= 5, default is 1
+            bit_rate: (mode="yosemite" only) the higher the bitrate, the clearer the video
+            max_size: (mode="ffmpeg" only) max size of the video frame, e.g.800, default is None.
+                      Smaller sizes lead to lower system load.
 
         Returns:
             save_path: path of video file
 
         Examples:
 
-            Record 30 seconds of video and export to the current directory test.mp4::
+            Record 30 seconds of video and export to the current directory test.mp4:
 
             >>> from airtest.core.api import connect_device, sleep
             >>> dev = connect_device("Android:///")
@@ -824,6 +915,10 @@ class Android(Device):
             >>> # the screen is landscape
             >>> landscape_mp4 = dev.start_recording(output="landscape.mp4", orientation=2)  # or orientation="landscape"
 
+            In ffmpeg mode, you can specify max_size to limit the video's maximum width/length. Smaller video sizes result in lower CPU load.
+
+            >>> dev.start_recording(output="test.mp4", mode="ffmpeg", max_size=800)
+
         """
         logdir = "./"
         if ST.LOG_DIR is not None:
@@ -831,12 +926,9 @@ class Android(Device):
         if output is None:
             save_path = os.path.join(logdir, "screen_%s.mp4" % (time.strftime("%Y%m%d%H%M%S", time.localtime())))
         else:
-            if os.path.isabs(output):
-                save_path = output
-            else:
-                save_path = os.path.join(logdir, output)
+            save_path = output if os.path.isabs(output) else os.path.join(logdir, output)
         self.recorder_save_path = save_path
-        
+
         if mode == "yosemite":
             if self.yosemite_recorder.recording_proc != None:
                 LOGGING.warning(
@@ -848,7 +940,7 @@ class Android(Device):
                 if bit_rate_level > 5:
                     bit_rate_level = 5
                 bit_rate = self.display_info['width'] * \
-                    self.display_info['height'] * bit_rate_level
+                        self.display_info['height'] * bit_rate_level
 
             if orientation == 1:
                 bool_is_vertical = "true"
@@ -871,14 +963,18 @@ class Android(Device):
         if self.recorder and self.recorder.is_running():
             LOGGING.warning("recording is already running, please don't call again")
             return None
-        
+
+        max_size = get_max_size(max_size)
         def get_frame():
             data = self.screen_proxy.get_frame_from_stream()
             frame = aircv.utils.string_2_img(data)
+
+            if max_size is not None:
+                frame = resize_by_max(frame, max_size)
             return frame
 
         self.recorder = ScreenRecorder(
-            save_path, get_frame, mode=mode, fps=fps,
+            save_path, get_frame, fps=fps,
             snapshot_sleep=snapshot_sleep, orientation=orientation)
         self.recorder.stop_time = max_time
         self.recorder.start()
@@ -890,14 +986,10 @@ class Android(Device):
         Stop recording the device display. Recoding file will be kept in the device.
 
         """
-        if self.yosemite_recorder.recording_proc != None:
+        if self.yosemite_recorder.recording_proc is not None or self.recorder is None:
             if output is None:
                 output = self.recorder_save_path
             return self.yosemite_recorder.stop_recording(output=output, is_interrupted=is_interrupted)
-
-        if self.recorder is None:
-            LOGGING.warning("start_recording first")
-            return False
         
         LOGGING.info("stopping recording")
         self.recorder.stop()
@@ -907,6 +999,71 @@ class Android(Device):
             shutil.move(self.recorder_save_path, output)
             LOGGING.info("save video to {}".format(output))
         return True
+
+    def get_clipboard(self):
+        """
+        Get the clipboard content
+
+        Returns:
+            clipboard content
+
+        Examples:
+            >>> dev = Android()
+            >>> dev.set_clipboard("hello world")
+            >>> dev.get_clipboard()
+            'hello world'
+            >>> dev.paste()  # paste the clipboard content
+
+        """
+        return self.yosemite_ext.get_clipboard()
+
+    def set_clipboard(self, text):
+        """
+        Set the clipboard content
+
+        Args:
+            text: text to set
+
+        Returns:
+            None
+
+        """
+        self.yosemite_ext.set_clipboard(text)
+
+    def push(self, local, remote):
+        """
+        Push file to the device
+
+        Args:
+            local: local file or folder to be copied to the device
+            remote: destination on the device where the file will be copied
+
+        Returns:
+            The file path saved in the phone may be enclosed in quotation marks, eg. '"test\ file.txt"'
+
+        Examples:
+            >>> dev = connect_device("android:///")
+            >>> dev.push("test.txt", "/sdcard/test.txt")
+
+        """
+        return self.adb.push(local, remote)
+
+    def pull(self, remote, local=""):
+        """
+        Pull file from the device
+
+        Args:
+            remote: remote file to be downloaded from the device
+            local: local destination where the file will be downloaded from the device, if not specified, the current directory is used
+
+        Returns:
+            None
+
+        Examples:
+            >>> dev = connect_device("android:///")
+            >>> dev.pull("/sdcard/test.txt", "rename.txt")
+        """
+        return self.adb.pull(remote, local=local)
 
     def _register_rotation_watcher(self):
         """

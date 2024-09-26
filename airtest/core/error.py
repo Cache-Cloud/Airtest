@@ -70,6 +70,12 @@ class DeviceConnectionError(BaseError):
     DEVICE_CONNECTION_ERROR = r"error:\s*((device \'\S+\' not found)|(cannot connect to daemon at [\w\:\s\.]+ Connection timed out))"
     pass
 
+class NoDeviceError(BaseError):
+    """
+        When no device is connected
+    """
+    pass
+
 
 class ICmdError(Exception):
     """
@@ -109,3 +115,11 @@ class MinitouchError(BaseError):
 
 class PerformanceError(BaseError):
     pass
+
+
+class LocalDeviceError(BaseError):
+    """
+    Custom exception for calling a method on a non-local iOS device.
+    """
+    def __init__(self, value="Can only use this method on a local device."):
+        super().__init__(value)

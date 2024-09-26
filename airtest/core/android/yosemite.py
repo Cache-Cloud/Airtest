@@ -1,3 +1,4 @@
+import traceback
 import warnings
 from .constant import YOSEMITE_APK, YOSEMITE_PACKAGE
 from airtest.utils.snippet import on_method_ready
@@ -40,11 +41,12 @@ class Yosemite(object):
             LOGGING.info(
                 "local version code is {}, installed version code is {}".format(apk_version, installed_version))
             try:
-                self.adb.install_app(apk_path, replace=True, install_options=["-t", "-g"])
+                self.adb.pm_install(apk_path, replace=True, install_options=["-t"])
             except:
                 if installed_version is None:
                     raise
                 # If the installation fails, but the phone has an old version, do not force the installation
+                print(traceback.format_exc())
                 warnings.warn("Yosemite.apk update failed, please try to reinstall manually(airtest/core/android/static/apks/Yosemite.apk).")
 
     @on_method_ready('install_or_upgrade')
